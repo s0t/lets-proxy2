@@ -10,12 +10,12 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"net"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/rekby/fixenv"
 	"github.com/rekby/lets-proxy2/internal/cache"
 
 	"go.uber.org/zap"
@@ -31,7 +31,6 @@ import (
 	"golang.org/x/crypto/acme"
 )
 
-const testACMEServer = "https://acme-server:4001/dir"
 const rsaKeyLength = 2048
 
 type contextConnection struct {
@@ -51,12 +50,12 @@ func init() {
 	}
 }
 
-func createTestClient(t *testing.T) *acme.Client {
-	resp, err := http.Get(testACMEServer)
+func createTestClientManager(env fixenv.Env, t *testing.T) *AcmeClientManagerMock {
+	resp, err := http.Get(th.AcmeServerDirURL(env))
 	if err != nil {
 		t.Fatalf("Can't connect to buoulder server: %q", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	client := acme.Client{}
 	client.HTTPClient = &http.Client{
@@ -68,7 +67,7 @@ func createTestClient(t *testing.T) *acme.Client {
 		},
 	}
 
-	client.DirectoryURL = testACMEServer
+	client.DirectoryURL = th.AcmeServerDirURL(env)
 	client.Key, _ = rsa.GenerateKey(rand.Reader, rsaKeyLength)
 	_, err = client.Register(context.Background(), &acme.Account{}, func(tosURL string) bool {
 		return true
@@ -77,7 +76,11 @@ func createTestClient(t *testing.T) *acme.Client {
 	if err != nil {
 		t.Fatalf("Can't initialize acme client: %v", err)
 	}
-	return &client
+
+	clientManager := NewAcmeClientManagerMock(t)
+	clientManager.CloseMock.Return(nil)
+	clientManager.GetClientMock.Return(&client, func() {}, nil)
+	return clientManager
 }
 
 func TestGetKeyType(t *testing.T) {
@@ -104,29 +107,40 @@ func TestGetKeyType(t *testing.T) {
 	}, "cert is nil")
 }
 
-func TestStoreCertificate(t *testing.T) {
-	ctx, flush := th.TestContext(t)
+func TestStoreLoadCertificate(t *testing.T) {
+	e, ctx, flush := th.NewEnv(t)
 	defer flush()
 
-	//nolint:gosec
-	key, _ := rsa.GenerateKey(rand.Reader, 512)
-
-	cert := &tls.Certificate{Certificate: [][]byte{
-		{1, 2, 3},
-		{4, 5, 6},
-	},
-		PrivateKey: key,
-	}
+	certBytes, keyBytes := fastCreateTestCert([]string{"domain.com"}, time.Now())
+	cert, err := tls.X509KeyPair(certBytes, keyBytes)
+	e.CmpNoError(err)
+	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+	e.CmpNoError(err)
 
 	mc := minimock.NewController(t)
-	cacheMock := NewBytesMock(mc).PutMock.Set(func(ctx context.Context, key string, data []byte) (err error) {
-		fmt.Println(key)
-		fmt.Println(string(data))
+	c := make(map[string][]byte)
+	cacheMock := NewBytesMock(mc)
+	cacheMock.PutMock.Set(func(ctx context.Context, key string, data []byte) (err error) {
+		c[key] = data
 		return nil
 	})
-	cacheMock.GetMock.Return(nil, cache.ErrCacheMiss)
+	cacheMock.GetMock.Set(func(ctx context.Context, key string) (ba1 []byte, err error) {
+		data, ok := c[key]
+		if ok {
+			return data, nil
+		}
+		return nil, cache.ErrCacheMiss
+	})
 
-	storeCertificate(ctx, cacheMock, CertDescription{MainDomain: "asd", KeyType: KeyRSA}, cert)
+	cd := CertDescription{MainDomain: "asd", KeyType: KeyRSA}
+	err = storeCertificate(ctx, cacheMock, cd, &cert)
+	e.CmpNoError(err)
+
+	resCert, err := loadCertificateFromCache(ctx, cacheMock, cd)
+	e.CmpNoError(err)
+
+	e.CmpNoError(err)
+	e.Cmp(resCert, &cert)
 }
 
 func TestIsNeedRenew(t *testing.T) {
@@ -148,7 +162,7 @@ type testManagerContext struct {
 	cache                  *BytesMock
 	certForDomainAuthorize *ValueMock
 	certState              *ValueMock
-	client                 *AcmeClientMock
+	clientManager          *AcmeClientManagerMock
 	domainChecker          *DomainCheckerMock
 	httpTokens             *BytesMock
 }
@@ -185,6 +199,43 @@ func TestManager_CertForDenied(t *testing.T) {
 	td.CmpError(err)
 }
 
+func TestManagerFilterTlsHello(t *testing.T) {
+	t.Run("AllowInsecureChipers_True", func(t *testing.T) {
+		e, ctx, flush := th.NewEnv(t)
+		defer flush()
+
+		m := Manager{}
+		m.AllowInsecureTLSChipers = true
+
+		hello := tls.ClientHelloInfo{
+			CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
+		}
+		m.filterTlsHello(ctx, &hello)
+
+		expectedHello := tls.ClientHelloInfo{
+			CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
+		}
+		e.Cmp(hello, expectedHello)
+	})
+	t.Run("AllowInsecureChipers_False", func(t *testing.T) {
+		e, ctx, flush := th.NewEnv(t)
+		defer flush()
+
+		m := Manager{}
+		m.AllowInsecureTLSChipers = false
+
+		hello := tls.ClientHelloInfo{
+			CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
+		}
+		m.filterTlsHello(ctx, &hello)
+
+		expectedHello := tls.ClientHelloInfo{
+			CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
+		}
+		e.Cmp(hello, expectedHello)
+	})
+}
+
 func TestGetCertificateDenyCertificates(t *testing.T) {
 	td := testdeep.NewT(t)
 	m := Manager{}
@@ -210,7 +261,7 @@ func createManager(t *testing.T) (res testManagerContext, cancel func()) {
 		Context: zc.WithLogger(context.Background(), zap.NewNop()),
 	}
 	res.cache = NewBytesMock(mc)
-	res.client = NewAcmeClientMock(mc)
+	res.clientManager = NewAcmeClientManagerMock(mc)
 	res.certForDomainAuthorize = NewValueMock(mc)
 	res.certState = NewValueMock(mc)
 	res.domainChecker = NewDomainCheckerMock(mc)
@@ -219,7 +270,7 @@ func createManager(t *testing.T) (res testManagerContext, cancel func()) {
 	res.manager = &Manager{
 		CertificateIssueTimeout: time.Second,
 		Cache:                   res.cache,
-		Client:                  res.client,
+		acmeClientManager:       res.clientManager,
 		DomainChecker:           res.domainChecker,
 		EnableHTTPValidation:    true,
 		EnableTLSValidation:     true,

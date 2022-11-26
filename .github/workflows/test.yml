@@ -1,0 +1,27 @@
+name: Test
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: "1.18"
+
+      - name: test-build
+        run: go build -mod=vendor -v ./...
+
+      - name: Test
+        run: go test -mod=vendor -covermode=count -coverprofile=coverage.out -v ./...
+
+      - name: push coverage
+        uses: shogo82148/actions-goveralls@v1
+        with:
+          path-to-profile: coverage.out

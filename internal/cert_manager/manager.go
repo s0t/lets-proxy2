@@ -47,6 +47,21 @@ const (
 	httpWellKnown = "/.well-known/acme-challenge/"
 )
 
+var (
+	// copy from go 1.17 insecure chipers
+	// https://github.com/golang/go/blob/ba66d62b688d50f4e89b724d1c5b48bb05f8b117/src/crypto/tls/cipher_suites.go#L84
+	insecureChipers = map[uint16]struct{}{
+		tls.TLS_RSA_WITH_RC4_128_SHA:                {},
+		tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA:           {},
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA256:         {},
+		tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA:        {},
+		tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA:          {},
+		tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA:     {},
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256: {},
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256:   {},
+	}
+)
+
 const domainKeyRSALength = 2048
 const renewBeforeExpire = time.Hour * 24 * 30
 const revokeAuthorizationTimeout = 5 * time.Minute
@@ -81,7 +96,7 @@ func (t KeyType) String() string {
 	return string(t)
 }
 
-// Interface inspired to https://godoc.org/golang.org/x/crypto/acme/autocert#Manager but not compatible guarantee
+// Manager interface inspired to https://godoc.org/golang.org/x/crypto/acme/autocert#Manager but not compatible guarantee
 type Manager struct {
 	CertificateIssueTimeout time.Duration
 	Cache                   cache.Bytes
@@ -90,21 +105,14 @@ type Manager struct {
 	// Every subdomain must have suffix dot. For example: "www."
 	AutoSubdomains []string
 
-	// Client is used to perform low-level operations, such as account registration
-	// and requesting new certificates.
-	//
-	// If Client is nil, a zero-value acme.Client is used with acme.LetsEncryptURL
-	// as directory endpoint. If the Client.Key is nil, a new ECDSA P-256 key is
-	// generated and, if Cache is not nil, stored in cache.
-	//
-	// Mutating the field after the first call of GetCertificate method will have no effect.
-	Client               AcmeClient
-	DomainChecker        DomainChecker
-	EnableHTTPValidation bool
-	EnableTLSValidation  bool
-	SaveJSONMeta         bool
-	AllowECDSACert       bool
-	AllowRSACert         bool
+	acmeClientManager       AcmeClientManager
+	DomainChecker           DomainChecker
+	EnableHTTPValidation    bool
+	EnableTLSValidation     bool
+	SaveJSONMeta            bool
+	AllowECDSACert          bool
+	AllowRSACert            bool
+	AllowInsecureTLSChipers bool
 
 	certForDomainAuthorize cache.Value
 
@@ -118,9 +126,9 @@ type Manager struct {
 	handleCertFinish, certRequestFinish metrics.ProcessFinishFunc
 }
 
-func New(client AcmeClient, c cache.Bytes, r prometheus.Registerer) *Manager {
+func New(acmeClientManager AcmeClientManager, c cache.Bytes, r prometheus.Registerer) *Manager {
 	res := Manager{}
-	res.Client = client
+	res.acmeClientManager = acmeClientManager
 	res.certForDomainAuthorize = cache.NewMemoryValueLRU("authcert")
 	res.certState = cache.NewMemoryValueLRU("certstate")
 	res.CertificateIssueTimeout = time.Minute
@@ -144,6 +152,8 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (resultCert *tls.Ce
 	ctx := hello.Conn.(GetContext).GetContext()
 
 	logger := zc.L(ctx)
+
+	m.filterTlsHello(ctx, hello)
 
 	needDomain, err := domain.NormalizeDomain(hello.ServerName)
 	log.DebugInfo(logger, err, "Domain name normalization", zap.String("original", hello.ServerName), domain.LogDomain(needDomain))
@@ -396,13 +406,37 @@ func (m *Manager) createCertificateForDomains(ctx context.Context, cd CertDescri
 
 	logger.Debug("Start issue process")
 
-	order, err := m.createOrderForDomains(ctx, domainNames...)
+	for {
+		acmeClient, acmeClientDisableFunc, err := m.acmeClientManager.GetClient(ctx)
+		log.DebugError(logger, err, "Get acme client")
+		if err != nil {
+			return nil, xerrors.Errorf("failed to get acme client: %w", err)
+		}
+
+		res, err := m.createOrderAndCertificate(ctx, acmeClient, cd, domainNames)
+		switch {
+		case err == nil:
+			return res, nil
+		case isErrTooManyOrders(err):
+			logger.Info("Too many orders, try next client")
+			acmeClientDisableFunc()
+			continue
+		default:
+			return nil, err
+		}
+	}
+}
+
+func (m *Manager) createOrderAndCertificate(ctx context.Context, acmeClient AcmeClient, cd CertDescription, domainNames []domain.DomainName) (*tls.Certificate, error) {
+	logger := zc.L(ctx)
+
+	order, err := m.createOrderForDomains(ctx, acmeClient, domainNames...)
 	log.DebugWarning(logger, err, "Domains authorized")
 	if err != nil {
 		return nil, errors.New("order authorization error")
 	}
 
-	res, err = m.issueCertificate(ctx, cd, order)
+	res, err := m.issueCertificate(ctx, acmeClient, cd, order)
 	log.DebugWarning(logger, err, "Issue certificate")
 	return res, err
 }
@@ -421,8 +455,7 @@ func (m *Manager) supportedChallenges() []string {
 // createOrderForDomains similar to func (m *Manager) verifyRFC(ctx context.Context, client *acme.Client, domain string) (*acme.Order, error)
 // from acme/autocert
 //nolint:funlen,gocognit
-func (m *Manager) createOrderForDomains(ctx context.Context, domains ...domain.DomainName) (*acme.Order, error) {
-	client := m.Client
+func (m *Manager) createOrderForDomains(ctx context.Context, acmeClient AcmeClient, domains ...domain.DomainName) (*acme.Order, error) {
 	logger := zc.L(ctx)
 	challengeTypes := m.supportedChallenges()
 	logger.Debug("Start order authorization.")
@@ -445,7 +478,7 @@ authorizeOrderLoop:
 			authIDs[i] = acme.AuthzID{Type: "dns", Value: domains[i].ASCII()}
 		}
 		var err error
-		order, err = m.Client.AuthorizeOrder(ctx, authIDs)
+		order, err = acmeClient.AuthorizeOrder(ctx, authIDs)
 		log.DebugError(logger, err, "Create authorization order.", zap.Reflect("order", order))
 		if err != nil {
 			return nil, err
@@ -462,7 +495,7 @@ authorizeOrderLoop:
 				defer cancel()
 
 				revokeCtx = zc.WithLogger(revokeCtx, revokeLogger)
-				m.deactivatePendingAuthz(revokeCtx, order.AuthzURLs)
+				m.deactivatePendingAuthz(revokeCtx, acmeClient, order.AuthzURLs)
 			}(order)
 		}(order)
 
@@ -483,7 +516,7 @@ authorizeOrderLoop:
 		// Satisfy all pending authorizations.
 	authDomainLoop:
 		for _, zurl := range order.AuthzURLs {
-			z, err := client.GetAuthorization(ctx, zurl)
+			z, err := acmeClient.GetAuthorization(ctx, zurl)
 
 			log.DebugError(logger, err, "Get authorization object.", zap.Reflect("authorization", z))
 			if err != nil {
@@ -510,7 +543,7 @@ authorizeOrderLoop:
 				hasCompatibleChallenge = true
 
 				// Respond to the challenge and wait for validation result.
-				cleanup, err := m.fulfill(ctx, chal, domain.DomainName(z.Identifier.Value))
+				cleanup, err := m.fulfill(ctx, acmeClient, chal, domain.DomainName(z.Identifier.Value))
 				log.DebugError(logger, err, "Write respond to challenge")
 				if err != nil {
 					continue authorizeOrderLoop
@@ -521,12 +554,12 @@ authorizeOrderLoop:
 				//noinspection GoDeferInLoop
 				defer cleanup(cleanupContext)
 
-				authorizedChallenge, err := client.Accept(ctx, chal)
+				authorizedChallenge, err := acmeClient.Accept(ctx, chal)
 				log.DebugError(logger, err, "accept authorization", zap.Reflect("authorized_challenge", authorizedChallenge))
 				if err != nil {
 					continue authorizeOrderLoop
 				}
-				authorization, err := client.WaitAuthorization(ctx, z.URI)
+				authorization, err := acmeClient.WaitAuthorization(ctx, z.URI)
 				log.DebugError(logger, err, "wait authorization", zap.Reflect("authorization", authorization))
 				if err != nil {
 					continue authorizeOrderLoop
@@ -540,7 +573,7 @@ authorizeOrderLoop:
 
 		// All authorizations are satisfied.
 		// Wait for the CA to update the order status.
-		order, err = client.WaitOrder(ctx, order.URI)
+		order, err = acmeClient.WaitOrder(ctx, order.URI)
 		log.DebugWarning(logger, err, "Wait order authorization.", zap.Reflect("order", order))
 		if err == nil {
 			break authorizeOrderLoop
@@ -549,7 +582,7 @@ authorizeOrderLoop:
 	return order, nil
 }
 
-func (m *Manager) issueCertificate(ctx context.Context, cd CertDescription, order *acme.Order) (*tls.Certificate, error) {
+func (m *Manager) issueCertificate(ctx context.Context, acmeClient AcmeClient, cd CertDescription, order *acme.Order) (*tls.Certificate, error) {
 	if len(order.Identifiers) == 0 {
 		return nil, errors.New("no domains for issue certificate")
 	}
@@ -572,7 +605,7 @@ func (m *Manager) issueCertificate(ctx context.Context, cd CertDescription, orde
 		return nil, err
 	}
 
-	der, _, err := m.Client.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
+	der, _, err := acmeClient.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 	log.InfoError(logger, err, "Receive certificate from acme server")
 	if err != nil {
 		return nil, err
@@ -612,18 +645,18 @@ func (m *Manager) renewCertInBackground(ctx context.Context, needDomain domain.D
 	log.DebugError(logger, err, "Cert reissue in background finished")
 }
 
-func (m *Manager) deactivatePendingAuthz(ctx context.Context, uries []string) {
+func (m *Manager) deactivatePendingAuthz(ctx context.Context, acmeClient AcmeClient, uries []string) {
 	logger := zc.L(ctx)
 
 	for _, uri := range uries {
 		localLogger := logger.With(zap.String("uri", uri))
-		authorization, err := m.Client.GetAuthorization(ctx, uri)
+		authorization, err := acmeClient.GetAuthorization(ctx, uri)
 		log.DebugError(localLogger, err, "Get authorization", zap.Reflect("authorization", authorization))
 		if err != nil {
 			continue
 		}
 		if authorization.Status == acme.StatusPending {
-			err := m.Client.RevokeAuthorization(ctx, uri)
+			err := acmeClient.RevokeAuthorization(ctx, uri)
 			log.DebugInfo(localLogger, err, "Revoke authorization", zap.String("uri", uri))
 		} else {
 			localLogger.Debug("Authorization not in pending state. Skip revoke.", zap.String("status", authorization.Status))
@@ -648,12 +681,29 @@ func (m *Manager) certKeyGetOrCreate(ctx context.Context, cd CertDescription) (c
 	return key, err
 }
 
-func (m *Manager) fulfill(ctx context.Context, challenge *acme.Challenge, domain domain.DomainName) (func(context.Context), error) {
+func (m *Manager) filterTlsHello(ctx context.Context, hello *tls.ClientHelloInfo) {
+	if m.AllowInsecureTLSChipers {
+		log.DebugCtx(ctx, "Disable filter chiper suites")
+		return
+	}
+
+	newChipers := make([]uint16, 0, len(hello.CipherSuites))
+	for _, chiper := range hello.CipherSuites {
+		if _, insecure := insecureChipers[chiper]; insecure {
+			log.DebugCtx(ctx, "Exclude insecure chiper from tls hello: %v", zap.Uint16("chiper_code", chiper))
+			continue
+		}
+		newChipers = append(newChipers, chiper)
+	}
+	hello.CipherSuites = newChipers
+}
+
+func (m *Manager) fulfill(ctx context.Context, acmeClient AcmeClient, challenge *acme.Challenge, domain domain.DomainName) (func(context.Context), error) {
 	logger := zc.L(ctx)
 
 	switch challenge.Type {
 	case tlsAlpn01:
-		cert, err := m.Client.TLSALPN01ChallengeCert(challenge.Token, domain.String())
+		cert, err := acmeClient.TLSALPN01ChallengeCert(challenge.Token, domain.String())
 		log.DebugError(logger, err, "Got TLSALPN01ChallengeCert", log.Cert(&cert))
 		if err != nil {
 			return nil, err
@@ -664,7 +714,7 @@ func (m *Manager) fulfill(ctx context.Context, challenge *acme.Challenge, domain
 			go m.deleteCertToken(localContext, domain)
 		}, nil
 	case http01:
-		resp, err := m.Client.HTTP01ChallengeResponse(challenge.Token)
+		resp, err := acmeClient.HTTP01ChallengeResponse(challenge.Token)
 		if err != nil {
 			return nil, err
 		}
@@ -963,6 +1013,13 @@ func isCertLocked(ctx context.Context, storage cache.Bytes, certName CertDescrip
 	default:
 		return false, err
 	}
+}
+
+func isErrTooManyOrders(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "too many new orders recently")
 }
 
 // copy from golang.org/x/crypto/acme/autocert/autocert.go

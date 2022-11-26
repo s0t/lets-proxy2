@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rekby/lets-proxy2/internal/docker"
-
 	"golang.org/x/xerrors"
 
 	"github.com/rekby/lets-proxy2/internal/config"
@@ -122,16 +120,20 @@ func startProgram(config *configType) {
 
 	storage := &cache.DiskCache{Dir: config.General.StorageDir}
 	clientManager := acme_client_manager.New(ctx, storage)
-	clientManager.DirectoryURL = config.General.AcmeServer
-	acmeClient, err := clientManager.GetClient(ctx)
-	log.DebugFatal(logger, err, "Get acme client")
 
-	certManager := cert_manager.New(acmeClient, storage, registry)
+	clientManager.DirectoryURL = config.General.AcmeServer
+	logger.Info("Acme directory", zap.String("url", config.General.AcmeServer))
+
+	_, _, err = clientManager.GetClient(ctx)
+	log.InfoFatal(logger, err, "Get acme client")
+
+	certManager := cert_manager.New(clientManager, storage, registry)
 	certManager.CertificateIssueTimeout = time.Duration(config.General.IssueTimeout) * time.Second
 	certManager.SaveJSONMeta = config.General.StoreJSONMetadata
 
 	certManager.AllowECDSACert = config.General.AllowECDSACert
 	certManager.AllowRSACert = config.General.AllowRSACert
+	certManager.AllowInsecureTLSChipers = config.General.AllowInsecureTLSChipers
 
 	for _, subdomain := range config.General.Subdomains {
 		subdomain = strings.TrimSpace(subdomain)
@@ -139,13 +141,7 @@ func startProgram(config *configType) {
 		certManager.AutoSubdomains = append(certManager.AutoSubdomains, subdomain)
 	}
 
-	var dockerClient docker.Interface
-	if config.DockerRouter.Enable {
-		dockerClient, err = docker.New(config.DockerRouter.Config)
-		log.InfoFatal(logger, err, "Enable docker router")
-	}
-
-	certManager.DomainChecker, err = config.CheckDomains.CreateDomainChecker(ctx, dockerClient)
+	certManager.DomainChecker, err = config.CheckDomains.CreateDomainChecker(ctx)
 	log.DebugFatal(logger, err, "Config domain checkers.")
 
 	err = startMetrics(ctx, registry, config.Metrics, certManager.GetCertificate)
@@ -168,7 +164,7 @@ func startProgram(config *configType) {
 		return tlsListener.GetConnectionContext(req.RemoteAddr, localAddr.String())
 	}
 
-	err = config.Proxy.Apply(ctx, p, dockerClient)
+	err = config.Proxy.Apply(ctx, p)
 	log.InfoFatal(logger, err, "Apply proxy config")
 
 	go func() {
